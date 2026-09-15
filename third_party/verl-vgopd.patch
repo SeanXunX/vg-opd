@@ -1,0 +1,374 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 268f8d5f..97ea9fc8 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -424,13 +424,18 @@ class AgentLoopWorker:
+         # Online policy distillation
+         self.distillation_enabled = is_distillation_enabled(config.distillation)
+         if self.distillation_enabled:
+-            from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
++            import os as _os
+ 
+             self.teacher_key: str = config.distillation.teacher_key
+-            self.teacher_server_manager = AsyncTeacherLLMServerManager(
+-                config=config,
+-                teacher_client=teacher_client,
+-            )
++            if _os.getenv("CROPD_VGOPD_HOOK"):
++                self.teacher_server_manager = None
++            else:
++                from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
++
++                self.teacher_server_manager = AsyncTeacherLLMServerManager(
++                    config=config,
++                    teacher_client=teacher_client,
++                )
+ 
+         # Load tools once per worker; each trajectory just reuses self.tools.
+         tool_config_path = self.rollout_config.multi_turn.tool_config_path
+@@ -559,6 +565,23 @@ class AgentLoopWorker:
+             )
+         outputs = await asyncio.gather(*tasks)
+ 
++        if not validate and os.getenv("CROPD_CRIPO"):
++            try:
++                from cropd.verl_ext.cripo import attach_flip_inputs
++
++                _gid = batch.non_tensor_batch.get("uid")
++                _gid = list(_gid) if _gid is not None else index.tolist()
++                await attach_flip_inputs(
++                    outputs,
++                    _gid,
++                    batch.non_tensor_batch.get("extra_info"),
++                    self.llm_client,
++                    self.tokenizer,
++                    int(getattr(config, "max_model_len", 0) or 8192),
++                )
++            except Exception as e:
++                logger.warning(f"[cropd] cripo attach_flip_inputs failed: {e}")
++
+         output = self._postprocess(
+             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+         )
+@@ -740,6 +768,13 @@ class AgentLoopWorker:
+                 response_length=len(output.response_ids),
+                 pad_token_id=self.tokenizer.pad_token_id,
+             )
++        _dw = output.extra_fields.get("distill_weights")
++        if _dw is not None:
++            _rw = response_output["input_ids"].shape[1]
++            _pad = _rw - _dw.shape[0]
++            if _pad > 0:
++                _dw = torch.cat([_dw, torch.zeros(_pad, dtype=_dw.dtype)])
++            output.extra_fields["distill_weights"] = _dw[:_rw].unsqueeze(0)
+ 
+         return _InternalAgentLoopOutput(
+             prompt_ids=prompt_output["input_ids"],
+@@ -909,6 +945,14 @@ class AgentLoopWorker:
+         sample_kwargs: Optional[dict[str, Any]] = None,
+     ) -> None:
+         """Compute teacher logprobs for single sample."""
++        if self.distillation_enabled and not validate:
++            import os as _os
++
++            if _os.getenv("CROPD_VGOPD_HOOK"):
++                from cropd.verl_ext.agent_hook import cropd_gate_and_teacher
++
++                await cropd_gate_and_teacher(output, prompt_ids, response_ids, sample_kwargs, self.tokenizer)
++                return
+         if self.distillation_enabled and not validate:
+             routing_key = None
+             if sample_kwargs is not None:
+@@ -947,6 +993,23 @@ class AgentLoopWorker:
+         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
++        if inputs[0].extra_fields.get("distill_weights") is not None:
++            optional_outputs["distill_weights"] = torch.cat(
++                [input.extra_fields.pop("distill_weights") for input in inputs], dim=0
++            )
++        if os.getenv("CROPD_CRIPO") and not validate:
++            _rw = response_ids.shape[1]
++
++            def _pop_or_zero(inp, key):
++                v = inp.extra_fields.pop(key, None)
++                return v if v is not None else torch.zeros(1, _rw, dtype=torch.float32)
++
++            optional_outputs["cripo_t_lp"] = torch.cat(
++                [_pop_or_zero(inp, "cripo_t_lp") for inp in inputs], dim=0
++            )
++            optional_outputs["cripo_t_top1"] = torch.cat(
++                [_pop_or_zero(inp, "cripo_t_top1") for inp in inputs], dim=0
++            )
+         batch = TensorDict(
+             {
+                 "prompts": prompt_ids,  # [bsz, prompt_length]
+@@ -1108,7 +1175,24 @@ class AgentLoopManager:
+         Returns:
+             DataProto: Output batch.
+         """
+-        chunkes = prompts.chunk(len(self.agent_loop_workers))
++        n_workers = len(self.agent_loop_workers)
++        chunkes = None
++        if os.getenv("CROPD_CRIPO") and not prompts.meta_info.get("validate", False):
++            uid = prompts.non_tensor_batch.get("uid")
++            if uid is not None and len(uid) > 0:
++                bounds = [i for i in range(1, len(uid)) if uid[i] != uid[i - 1]]
++                if len(bounds) >= n_workers - 1:
++                    cuts, prev_j = [0], -1
++                    for k in range(1, n_workers):
++                        ideal = len(uid) * k / n_workers
++                        lo, hi = prev_j + 1, len(bounds) - (n_workers - 1 - k)
++                        j = min(range(lo, hi), key=lambda i: abs(bounds[i] - ideal))
++                        prev_j = j
++                        cuts.append(bounds[j])
++                    cuts.append(len(uid))
++                    chunkes = [prompts.slice(cuts[k], cuts[k + 1]) for k in range(n_workers)]
++        if chunkes is None:
++            chunkes = prompts.chunk(n_workers)
+         outputs = await asyncio.gather(
+             *[
+                 worker.generate_sequences.remote(chunk)
+diff --git a/verl/trainer/distillation/fsdp/losses.py b/verl/trainer/distillation/fsdp/losses.py
+index c900286a..77963117 100644
+--- a/verl/trainer/distillation/fsdp/losses.py
++++ b/verl/trainer/distillation/fsdp/losses.py
+@@ -62,6 +62,54 @@ def compute_forward_kl_topk(
+         teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+     assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+ 
++    import os as _os
++
++    _chunk = int(_os.getenv("CROPD_TOPK_CHUNK", "0"))
++    if _chunk > 0:
++        from torch.utils.checkpoint import checkpoint as _ckpt
++
++        loss_config_c: DistillationLossConfig = config.distillation_loss
++
++        def _piece(logits_c, t_lp_c, t_id_c):
++            slp = F.log_softmax(logits_c, dim=-1)
++            s_topk = torch.gather(slp, dim=-1, index=t_id_c)
++            s_ids = torch.topk(slp, k=t_id_c.shape[-1], dim=-1).indices
++            s_mass = s_topk.exp().sum(dim=-1)
++            t_mass = t_lp_c.exp().sum(dim=-1)
++            s_topk_cl, t_lp_cl = s_topk, t_lp_c
++            if loss_config_c.log_prob_min_clamp is not None:
++                s_topk_cl = s_topk.clamp_min(loss_config_c.log_prob_min_clamp)
++                t_lp_cl = t_lp_c.clamp_min(loss_config_c.log_prob_min_clamp)
++            kl = kl_divergence(log_q=s_topk_cl, log_p=t_lp_cl)
++            ov = (t_id_c.unsqueeze(-1) == s_ids.unsqueeze(-2)).any(dim=-1)
++            ovc = ov.sum(dim=-1)
++            tkl = t_lp_cl.exp() * (t_lp_cl - s_topk_cl)
++            oa_sum = (-tkl * ov).sum(dim=-1)
++            oa = torch.where(ovc > 0, oa_sum / ovc.clamp_min(1), torch.zeros_like(oa_sum))
++            return kl, s_mass, t_mass, ovc.to(kl.dtype), oa
++
++        _bufs = [[], [], [], [], []]
++        _T = student_logits.shape[1]
++        for _s in range(0, _T, _chunk):
++            _e = min(_s + _chunk, _T)
++            _pieces = _ckpt(
++                _piece,
++                student_logits[:, _s:_e],
++                teacher_topk_log_probs[:, _s:_e],
++                teacher_topk_ids[:, _s:_e].long(),
++                use_reentrant=False,
++            )
++            for _b, _p in zip(_bufs, _pieces):
++                _b.append(_p)
++        _kl, _sm, _tm, _oc, _oa = (torch.cat(_b, dim=1) for _b in _bufs)
++        return {
++            "distillation_losses": _kl,
++            "student_mass": _sm,
++            "teacher_mass": _tm,
++            "overlap_count": _oc,
++            "overlap_token_advantage": _oa,
++        }
++
+     # 2. compute token-wise KL divergence across sp groups
+     student_log_probs = F.log_softmax(student_logits, dim=-1)
+     student_topk_ids = torch.topk(student_log_probs, k=teacher_topk_ids.shape[-1], dim=-1).indices
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index 07df0850..61c244b8 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -244,6 +244,16 @@ def distillation_loss(
+         model_output=model_output,
+         data=data,
+     )
++    import os
++
++    if os.getenv("CROPD_W_AT_AGG"):
++        _w = data.get("distill_weights", None)
++        if _w is not None:
++            if _w.is_nested:
++                _w = _w.to_padded_tensor(0.0)
++            _w = _w.to(dtype=distillation_losses.dtype, device=distillation_losses.device)
++            if _w.shape == distillation_losses.shape:
++                distillation_losses = distillation_losses * _w
+     response_mask = data["response_mask"]
+     loss_agg_mode = config.loss_agg_mode
+ 
+@@ -392,3 +403,15 @@ def compute_distillation_loss_reverse_kl_estimator(
+         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+     }
+     return distillation_losses, metrics
++
++
++def _cropd_load_external_losses() -> None:
++    import importlib
++    import os
++
++    module = os.getenv("CROPD_DISTILL_EXT")
++    if module:
++        importlib.import_module(module)
++
++
++_cropd_load_external_losses()
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index 8f6cd416..0c24cf71 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -177,13 +177,18 @@ class TaskRunner:
+ 
+         distillation_config = config.get("distillation")
+         if is_distillation_enabled(distillation_config):
+-            if distillation_config.n_gpus_per_node <= 0:
+-                raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
+-            if distillation_config.nnodes <= 0:
+-                raise ValueError("config.distillation.nnodes must be greater than 0")
++            import os as _os
+ 
+-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+-            resource_pool_spec["teacher_pool"] = teacher_pool
++            if _os.getenv("CROPD_VGOPD_HOOK"):
++                pass
++            else:
++                if distillation_config.n_gpus_per_node <= 0:
++                    raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
++                if distillation_config.nnodes <= 0:
++                    raise ValueError("config.distillation.nnodes must be greater than 0")
++
++                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
++                resource_pool_spec["teacher_pool"] = teacher_pool
+ 
+         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+ 
+@@ -207,6 +213,10 @@ class TaskRunner:
+         from verl.trainer.ppo.ray_trainer import Role
+ 
+         if is_distillation_enabled(config.get("distillation")):
++            import os as _os
++
++            if _os.getenv("CROPD_VGOPD_HOOK"):
++                return
+             # we do not use teacher model workers, so we only register teacher model in resource pool
+             # without registering a teacher model worker in role-worker mapping
+             self.mapping[Role.TeacherModel] = "teacher_pool"
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index d1eaa7bd..d604b2b9 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -915,14 +915,20 @@ class RayPPOTrainer:
+ 
+         # initialize teacher loop manager
+         if self.use_teacher_policy:
+-            from verl.experimental.teacher_loop import MultiTeacherModelManager
++            import os as _os
+ 
+-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+-            self.teacher_model_manager = MultiTeacherModelManager(
+-                config=self.config,
+-                resource_pool=teacher_resource_pool,
+-            )
+-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
++            if _os.getenv("CROPD_VGOPD_HOOK"):
++                self.teacher_model_manager = None
++                self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
++            else:
++                from verl.experimental.teacher_loop import MultiTeacherModelManager
++
++                teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
++                self.teacher_model_manager = MultiTeacherModelManager(
++                    config=self.config,
++                    resource_pool=teacher_resource_pool,
++                )
++                self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+         else:
+             self.teacher_model_manager = None
+             self.distillation_config = None
+@@ -951,7 +958,7 @@ class RayPPOTrainer:
+         self.async_rollout_manager = AgentLoopManager.create(
+             config=self.config,
+             llm_client=self.llm_server_manager.get_client(),
+-            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
++            teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager is not None else None,
+             reward_loop_worker_handles=reward_loop_worker_handles,
+         )
+ 
+@@ -1632,6 +1639,12 @@ class RayPPOTrainer:
+                             config=self.config.algorithm,
+                         )
+ 
++                        if os.getenv("CROPD_CRIPO"):
++                            from cropd.verl_ext.cripo import apply_flip
++
++                            batch, cripo_metrics = apply_flip(batch)
++                            metrics.update(cripo_metrics)
++
+                     # update critic
+                     if self.use_critic:
+                         with marked_timer("update_critic", timing_raw, color="pink"):
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index cc075d41..0622e2ed 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -258,6 +258,11 @@ class DistillationConfig(BaseConfig):
+         if not self.enabled:
+             return
+ 
++        import os as _os
++
++        if _os.getenv("CROPD_VGOPD_HOOK"):
++            return
++
+         self.teacher_models = self._resolve_teacher_models()
+         teacher_world_size_sum = 0
+         for teacher_model in self.teacher_models.values():
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 95a9391f..1a2f4ee8 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -365,13 +365,15 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
+         return
+ 
+     prompt_logprobs_ls, prompt_ids_ls = [], []
++    prompt_actual_ls = []
+     # NOTE: logprob of first prompt token is None.
+-    for logprobs_dict in output.prompt_logprobs[1:]:
++    for _pos, logprobs_dict in enumerate(output.prompt_logprobs[1:], start=1):
+         if num_prompt_logprobs == 0:
+             token_id_str = list(logprobs_dict.keys())[0]
+             logprob = logprobs_dict[token_id_str].logprob
+             prompt_logprobs_ls.append([logprob])
+             prompt_ids_ls.append([int(token_id_str)])
++            prompt_actual_ls.append(logprob)
+         else:
+             prompt_ids = [None] * num_prompt_logprobs
+             prompt_logprobs = [None] * num_prompt_logprobs
+@@ -386,10 +391,15 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
+                 prompt_logprobs[rank - 1] = logprob
+             prompt_logprobs_ls.append(prompt_logprobs)
+             prompt_ids_ls.append(prompt_ids)
++            _aid = output.prompt_token_ids[_pos]
++            _ent = logprobs_dict.get(_aid, logprobs_dict.get(str(_aid)))
++            prompt_actual_ls.append(float(_ent.logprob) if _ent is not None else 0.0)
+ 
+     # NOTE: pad a dummy prompt logprob for last prompt token.
+     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
+     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
++    prompt_actual_ls.append(0.0)
+ 
+     result_dict["prompt_ids"] = prompt_ids_ls
+     result_dict["prompt_logprobs"] = prompt_logprobs_ls
++    result_dict["prompt_actual_logprobs"] = prompt_actual_ls

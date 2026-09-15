@@ -1,0 +1,27 @@
+[project]
+name = "qwen-serve"
+version = "0.0.1"
+description = "Judge and data-service environment: a recent vLLM OpenAI-compatible server, isolated from the training stack"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "vllm>=0.17",
+    "openai",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "ninja>=1.13.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" }
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+torchaudio = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
