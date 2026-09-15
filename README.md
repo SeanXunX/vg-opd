@@ -29,7 +29,7 @@ weighted KL term is fused with the GRPO objective.
 
 ## Overview
 
-![framework](./assets/framework.jpeg)
+![framework](./assets/framework.png)
 
 ## Installation
 
